@@ -82,14 +82,19 @@ func (m Model) renderColumns() string {
 		end = n
 	}
 
+	slots := (m.height - chromeLines) / cardBoxHeight
+	if slots < 1 {
+		slots = 1
+	}
+
 	cols := make([]string, 0, end-start)
 	for i := start; i < end; i++ {
-		cols = append(cols, m.renderColumn(m.b.ColumnAt(i), i))
+		cols = append(cols, m.renderColumn(m.b.ColumnAt(i), i, slots))
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, cols...)
 }
 
-func (m Model) renderColumn(col *board.Column, idx int) string {
+func (m Model) renderColumn(col *board.Column, idx, slots int) string {
 	focused := idx == m.colIdx
 	headerStyle := columnHeaderBlurredStyle
 	boxStyle := columnBoxStyle
@@ -100,20 +105,57 @@ func (m Model) renderColumn(col *board.Column, idx int) string {
 
 	header := headerStyle.Render(fmt.Sprintf("%s (%d)", col.Title, len(col.CardOrder)))
 
-	var cardsView string
-	if len(col.CardOrder) == 0 {
-		cardsView = emptyColumnStyle.Render("(empty)")
-	} else {
-		cards := make([]string, 0, len(col.CardOrder))
-		for i, cardID := range col.CardOrder {
-			c := m.b.Cards[cardID]
-			cards = append(cards, m.renderCard(c, focused && i == m.cardIdx))
+	total := len(col.CardOrder)
+	start := 0
+	if focused {
+		if m.cardIdx >= start+slots {
+			start = m.cardIdx - slots + 1
 		}
-		cardsView = lipgloss.JoinVertical(lipgloss.Left, cards...)
+		if m.cardIdx < start {
+			start = m.cardIdx
+		}
+	}
+	if start+slots > total {
+		start = total - slots
+	}
+	if start < 0 {
+		start = 0
+	}
+	end := start + slots
+	if end > total {
+		end = total
 	}
 
-	content := lipgloss.JoinVertical(lipgloss.Left, header, cardsView)
+	posLine := ""
+	if total > slots {
+		posLine = fmt.Sprintf("%d-%d of %d", start+1, end, total)
+	}
+
+	var body string
+	if total == 0 {
+		body = padLines(emptyColumnStyle.Render("(empty)"), slots*cardBoxHeight)
+	} else {
+		cards := make([]string, 0, end-start)
+		for i := start; i < end; i++ {
+			c := m.b.Cards[col.CardOrder[i]]
+			cards = append(cards, m.renderCard(c, focused && i == m.cardIdx))
+		}
+		body = padLines(lipgloss.JoinVertical(lipgloss.Left, cards...), slots*cardBoxHeight)
+	}
+
+	content := lipgloss.JoinVertical(lipgloss.Left, header, scrollIndicatorStyle.Render(posLine), body)
 	return boxStyle.Render(content)
+}
+
+// padLines pads s with blank lines until it has exactly targetLines lines,
+// so every column box renders at the same height regardless of how many
+// cards it holds.
+func padLines(s string, targetLines int) string {
+	got := strings.Count(s, "\n") + 1
+	if got >= targetLines {
+		return s
+	}
+	return s + strings.Repeat("\n", targetLines-got)
 }
 
 func (m Model) renderCard(c *board.Card, focused bool) string {
@@ -123,19 +165,17 @@ func (m Model) renderCard(c *board.Card, focused bool) string {
 	}
 	style = cardColorStyle(c.Color, style)
 
-	title := c.Title
-	preview := firstLine(c.Body, 34)
+	title := truncateOneLine(c.Title, cardTextWidth)
+	preview := truncateOneLine(c.Body, cardTextWidth)
 
-	var content string
+	content := title + "\n"
 	if preview != "" {
-		content = lipgloss.JoinVertical(lipgloss.Left, title, cardBodyPreviewStyle.Render(preview))
-	} else {
-		content = title
+		content += cardBodyPreviewStyle.Render(preview)
 	}
 	return style.Render(content)
 }
 
-func firstLine(s string, maxLen int) string {
+func truncateOneLine(s string, maxLen int) string {
 	line := s
 	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
 		line = s[:idx]

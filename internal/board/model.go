@@ -21,6 +21,7 @@ type Column struct {
 	Title     string    `json:"title"`
 	CardOrder []string  `json:"cardOrder"`
 	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 type Board struct {
@@ -54,6 +55,50 @@ func New(name string) *Board {
 		Cards:         map[string]*Card{},
 		SchemaVersion: 1,
 	}
+}
+
+// ReplaceFrom overwrites b's contents with other's, keeping b's pointer
+// identity stable so in-flight closures that already captured b still see
+// the latest data. Used when an external process has changed the board file
+// on disk and it needs to be reloaded into the running program.
+func (b *Board) ReplaceFrom(other *Board) {
+	b.ID = other.ID
+	b.Name = other.Name
+	b.CreatedAt = other.CreatedAt
+	b.UpdatedAt = other.UpdatedAt
+	b.ColumnOrder = other.ColumnOrder
+	b.Columns = other.Columns
+	b.Cards = other.Cards
+	b.SchemaVersion = other.SchemaVersion
+}
+
+// Clone deep-copies b, including its Columns/Cards maps and their pointee
+// structs, so the result is unaffected by later in-place mutations (via
+// the AddCard/UpdateCard/... methods, which mutate Card/Column structs by
+// pointer) to the original. Used to take a frozen snapshot of the board -
+// e.g. as the "base" or "ours" side of a Merge - that won't shift under
+// the caller while an async save is in flight.
+func (b *Board) Clone() *Board {
+	nb := &Board{
+		ID:            b.ID,
+		Name:          b.Name,
+		CreatedAt:     b.CreatedAt,
+		UpdatedAt:     b.UpdatedAt,
+		ColumnOrder:   append([]string(nil), b.ColumnOrder...),
+		Columns:       make(map[string]*Column, len(b.Columns)),
+		Cards:         make(map[string]*Card, len(b.Cards)),
+		SchemaVersion: b.SchemaVersion,
+	}
+	for id, c := range b.Columns {
+		cc := *c
+		cc.CardOrder = append([]string(nil), c.CardOrder...)
+		nb.Columns[id] = &cc
+	}
+	for id, c := range b.Cards {
+		cc := *c
+		nb.Cards[id] = &cc
+	}
+	return nb
 }
 
 func (b *Board) ColumnAt(idx int) *Column {
@@ -143,7 +188,8 @@ func (b *Board) MoveCardToColumn(cardID, targetColumnID string) {
 }
 
 func (b *Board) AddColumn(title string) *Column {
-	col := &Column{ID: uuid.NewString(), Title: title, CardOrder: []string{}, CreatedAt: time.Now()}
+	now := time.Now()
+	col := &Column{ID: uuid.NewString(), Title: title, CardOrder: []string{}, CreatedAt: now, UpdatedAt: now}
 	b.Columns[col.ID] = col
 	b.ColumnOrder = append(b.ColumnOrder, col.ID)
 	return col
@@ -152,6 +198,7 @@ func (b *Board) AddColumn(title string) *Column {
 func (b *Board) RenameColumn(columnID, title string) {
 	if col, ok := b.Columns[columnID]; ok {
 		col.Title = title
+		col.UpdatedAt = time.Now()
 	}
 }
 

@@ -1,0 +1,54 @@
+{
+  "id": "8f8283ad-5305-4003-b3e5-4a3272cbe879",
+  "name": "board",
+  "createdAt": "2026-07-13T21:45:11.050381761-05:00",
+  "updatedAt": "2026-07-13T21:45:39.529118626-05:00",
+  "columnOrder": [
+    "010ce73c-cac7-46e6-85d1-ca689d0e009e",
+    "9761c361-9271-4dd1-bc66-ff91665eb4a9",
+    "62d18418-4f4c-4151-9175-3b3cf5ce0bad"
+  ],
+  "columns": {
+    "010ce73c-cac7-46e6-85d1-ca689d0e009e": {
+      "id": "010ce73c-cac7-46e6-85d1-ca689d0e009e",
+      "title": "Todo",
+      "cardOrder": [
+        "4005f32c-ab85-4d7c-ae4c-e38d3e4c3174"
+      ],
+      "createdAt": "2026-07-13T21:45:11.050381761-05:00"
+    },
+    "62d18418-4f4c-4151-9175-3b3cf5ce0bad": {
+      "id": "62d18418-4f4c-4151-9175-3b3cf5ce0bad",
+      "title": "Done",
+      "cardOrder": [],
+      "createdAt": "2026-07-13T21:45:11.050381761-05:00"
+    },
+    "9761c361-9271-4dd1-bc66-ff91665eb4a9": {
+      "id": "9761c361-9271-4dd1-bc66-ff91665eb4a9",
+      "title": "In Progress",
+      "cardOrder": [
+        "29ad0c74-dcdc-41bc-8f45-80efb04c5c0b"
+      ],
+      "createdAt": "2026-07-13T21:45:11.050381761-05:00"
+    }
+  },
+  "cards": {
+    "29ad0c74-dcdc-41bc-8f45-80efb04c5c0b": {
+      "id": "29ad0c74-dcdc-41bc-8f45-80efb04c5c0b",
+      "columnId": "9761c361-9271-4dd1-bc66-ff91665eb4a9",
+      "title": "Real-time file watcher (#1)",
+      "body": "https://github.com/brucevanhorn2/kankan-tui/issues/1",
+      "createdAt": "2026-07-13T21:45:23.575271779-05:00",
+      "updatedAt": "2026-07-13T21:45:35.173810629-05:00"
+    },
+    "4005f32c-ab85-4d7c-ae4c-e38d3e4c3174": {
+      "id": "4005f32c-ab85-4d7c-ae4c-e38d3e4c3174",
+      "columnId": "010ce73c-cac7-46e6-85d1-ca689d0e009e",
+      "title": "Recent boards list (#2)",
+      "body": "https://github.com/brucevanhorn2/kankan-tui/issues/2",
+      "createdAt": "2026-07-13T21:45:24.032937096-05:00",
+      "updatedAt": "2026-07-13T21:45:34.818456245-05:00"
+    }
+  },
+  "schemaVersion": 1
+}

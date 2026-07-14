@@ -18,31 +18,41 @@ func main() {
 		path = os.Args[1]
 	}
 
-	b, err := loadOrCreateBoard(path)
+	b, hash, err := loadOrCreateBoard(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "kankan-tui: %v\n", err)
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(ui.NewModel(b, path), tea.WithAltScreen())
+	w, err := board.NewWatcher(path)
+	if err != nil {
+		// Not fatal: kankan-tui still works without live-reload, it just
+		// won't pick up changes made by other processes until restarted.
+		fmt.Fprintf(os.Stderr, "kankan-tui: warning: file watch disabled: %v\n", err)
+	} else {
+		defer w.Close()
+	}
+
+	p := tea.NewProgram(ui.NewModel(b, path, hash, w), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "kankan-tui: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func loadOrCreateBoard(path string) (*board.Board, error) {
+func loadOrCreateBoard(path string) (*board.Board, string, error) {
 	if _, err := os.Stat(path); err == nil {
 		return board.Load(path)
 	} else if !os.IsNotExist(err) {
-		return nil, err
+		return nil, "", err
 	}
 
 	b := board.New(deriveBoardName(path))
-	if err := board.Save(path, b); err != nil {
-		return nil, err
+	hash, err := board.Save(path, b)
+	if err != nil {
+		return nil, "", err
 	}
-	return b, nil
+	return b, hash, nil
 }
 
 func deriveBoardName(path string) string {

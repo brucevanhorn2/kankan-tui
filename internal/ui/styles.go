@@ -5,6 +5,22 @@ import "github.com/charmbracelet/lipgloss"
 const (
 	colWidth = 30
 	colGap   = 1
+
+	// cardTextWidth is the usable text width inside a card box after its
+	// own border and padding are subtracted.
+	cardTextWidth = colWidth - 4 - 2
+
+	// cardBoxHeight is the fixed rendered height (in terminal rows) of a
+	// single card slot: 2 content lines + top/bottom border + bottom
+	// margin. Every card is padded/truncated to exactly this height so
+	// columns can be windowed by simple row arithmetic instead of
+	// re-measuring variable-height cards.
+	cardBoxHeight = 5
+
+	// chromeLines is everything around the card list in a column: the
+	// board title, the column box's border + bottom padding, the column
+	// header, the scroll-position line, and the status bar.
+	chromeLines = 7
 )
 
 var (
@@ -64,6 +80,10 @@ var (
 	emptyColumnStyle = lipgloss.NewStyle().
 				Foreground(colorSubtle).
 				Italic(true).
+				Padding(0, 1)
+
+	scrollIndicatorStyle = lipgloss.NewStyle().
+				Foreground(colorSubtle).
 				Padding(0, 1)
 
 	modalTitleStyle = lipgloss.NewStyle().

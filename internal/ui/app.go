@@ -31,8 +31,21 @@ const (
 	fieldBody
 )
 
-type saveResultMsg struct{ err error }
+type saveResultMsg struct {
+	gen    int
+	board  *board.Board
+	merged bool
+	hash   string
+	err    error
+}
 type clearStatusMsg struct{ token int }
+type externalChangeMsg struct{}
+type watchErrMsg struct{ err error }
+type reloadedMsg struct {
+	b    *board.Board
+	hash string
+	err  error
+}
 
 type Model struct {
 	b    *board.Board
@@ -47,7 +60,25 @@ type Model struct {
 	input    textinput.Model
 	textarea textarea.Model
 
-	editingCardID string
+	editingCardID  string
+	targetColumnID string
+	deleteCardID   string
+	deleteColumnID string
+
+	watcher      *board.Watcher
+	lastHash     string
+	pendingBoard *board.Board
+
+	// base is a frozen snapshot of the board as of the last point this
+	// process's in-memory state and the on-disk file were known to agree
+	// (last load, last successful save, last external reload). It's the
+	// common ancestor used to 3-way merge on save so a save never blindly
+	// clobbers another writer's change; see board.SaveMerging.
+	base *board.Board
+	// saveGen counts dispatched saves so a stale saveResultMsg (from a
+	// save superseded by a later one before it returned) can be told
+	// apart from the latest and ignored instead of regressing the model.
+	saveGen int
 
 	dirty     bool
 	status    string
@@ -57,7 +88,7 @@ type Model struct {
 	width, height int
 }
 
-func NewModel(b *board.Board, path string) Model {
+func NewModel(b *board.Board, path, initialHash string, w *board.Watcher) Model {
 	ti := textinput.New()
 	ti.CharLimit = 200
 
@@ -71,10 +102,16 @@ func NewModel(b *board.Board, path string) Model {
 		mode:     modeNormal,
 		input:    ti,
 		textarea: ta,
+		watcher:  w,
+		lastHash: initialHash,
+		base:     b.Clone(),
 	}
 }
 
 func (m Model) Init() tea.Cmd {
+	if m.watcher != nil {
+		return waitForWatch(m.watcher)
+	}
 	return nil
 }
 
@@ -88,12 +125,7 @@ func (m *Model) clampCardIdx() {
 		m.cardIdx = 0
 		return
 	}
-	if m.cardIdx >= len(col.CardOrder) {
-		m.cardIdx = len(col.CardOrder) - 1
-	}
-	if m.cardIdx < 0 {
-		m.cardIdx = 0
-	}
+	m.cardIdx = clamp(m.cardIdx, 0, len(col.CardOrder)-1)
 }
 
 func (m *Model) selectedCard() *board.Card {
@@ -104,6 +136,31 @@ func (m *Model) selectedCard() *board.Card {
 	return m.b.CardAt(col.ID, m.cardIdx)
 }
 
+func clamp(v, lo, hi int) int {
+	if hi < lo {
+		return lo
+	}
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// isTextEntryMode reports whether the user currently has typed, unsaved
+// input in a modal (as opposed to a confirm prompt, which has nothing to
+// lose). Only these modes defer an incoming external board change, so a
+// local edit-in-progress is never silently discarded.
+func isTextEntryMode(mo mode) bool {
+	switch mo {
+	case modeAddCard, modeAddColumn, modeRenameColumn, modeEditCard:
+		return true
+	}
+	return false
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -112,14 +169,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case saveResultMsg:
+		if msg.gen != m.saveGen {
+			// Superseded by a later save dispatched before this one
+			// returned; that save's snapshot already included whatever
+			// this one was trying to persist, so just drop it rather
+			// than regress the model with stale state.
+			return m, nil
+		}
 		if msg.err != nil {
 			m.err = msg.err
 			m.status = fmt.Sprintf("save failed: %v", msg.err)
 		} else {
 			m.dirty = false
-			m.status = "saved"
+			m.lastHash = msg.hash
+			m.base = msg.board.Clone()
+			if msg.merged {
+				m.b.ReplaceFrom(msg.board)
+				m.colIdx = clamp(m.colIdx, 0, len(m.b.ColumnOrder)-1)
+				m.clampCardIdx()
+				m.status = "merged external changes and saved"
+			} else {
+				m.status = "saved"
+			}
 		}
-		return m, m.scheduleStatusClear()
+		m.statusTok++
+		return m, clearStatusCmd(m.statusTok)
 
 	case clearStatusMsg:
 		if msg.token == m.statusTok {
@@ -127,18 +201,89 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case externalChangeMsg:
+		return m, tea.Batch(m.reloadCmd(), waitForWatch(m.watcher))
+
+	case watchErrMsg:
+		m.status = fmt.Sprintf("watch error: %v", msg.err)
+		m.statusTok++
+		return m, tea.Batch(clearStatusCmd(m.statusTok), waitForWatch(m.watcher))
+
+	case reloadedMsg:
+		nm := m.handleReloaded(msg)
+		nm.statusTok++
+		return nm, clearStatusCmd(nm.statusTok)
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
 	return m, nil
 }
 
-func (m Model) scheduleStatusClear() tea.Cmd {
-	m.statusTok++
-	tok := m.statusTok
+func (m Model) handleReloaded(msg reloadedMsg) Model {
+	if msg.err != nil {
+		// Likely a transient read (e.g. mid-write by a non-atomic writer).
+		// The next fs event will give us another chance.
+		return m
+	}
+	if msg.hash == m.lastHash {
+		// Our own save (or an external write with identical content).
+		return m
+	}
+	m.lastHash = msg.hash
+	if isTextEntryMode(m.mode) {
+		m.pendingBoard = msg.b
+		m.status = "board changed externally — applying once you finish"
+		return m
+	}
+	m.applyExternalBoard(msg.b)
+	return m
+}
+
+func (m *Model) applyExternalBoard(nb *board.Board) {
+	m.b.ReplaceFrom(nb)
+	m.base = nb.Clone()
+	m.colIdx = clamp(m.colIdx, 0, len(m.b.ColumnOrder)-1)
+	m.clampCardIdx()
+	m.dirty = false
+	m.status = "board updated externally"
+}
+
+// returnToNormal leaves whatever modal is open and, if an external board
+// change arrived while the user was typing, applies it now that there's no
+// unsaved input left to clobber.
+func (m *Model) returnToNormal() {
+	m.mode = modeNormal
+	if m.pendingBoard != nil {
+		nb := m.pendingBoard
+		m.pendingBoard = nil
+		m.applyExternalBoard(nb)
+	}
+}
+
+func clearStatusCmd(tok int) tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
 		return clearStatusMsg{token: tok}
 	})
+}
+
+func waitForWatch(w *board.Watcher) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case <-w.Events:
+			return externalChangeMsg{}
+		case err := <-w.Errors:
+			return watchErrMsg{err: err}
+		}
+	}
+}
+
+func (m Model) reloadCmd() tea.Cmd {
+	path := m.path
+	return func() tea.Msg {
+		b, hash, err := board.Load(path)
+		return reloadedMsg{b: b, hash: hash, err: err}
+	}
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -195,10 +340,12 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "a":
-		if m.currentColumn() == nil {
+		col := m.currentColumn()
+		if col == nil {
 			return m, nil
 		}
 		m.mode = modeAddCard
+		m.targetColumnID = col.ID
 		m.input.Placeholder = "Card title"
 		m.input.SetValue("")
 		m.input.Focus()
@@ -219,10 +366,12 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, textinput.Blink
 
 	case "d":
-		if m.selectedCard() == nil {
+		c := m.selectedCard()
+		if c == nil {
 			return m, nil
 		}
 		m.mode = modeConfirmDeleteCard
+		m.deleteCardID = c.ID
 		return m, nil
 
 	case "c":
@@ -232,6 +381,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		c.Color = nextCardColor(c.Color)
 		m.dirty = true
+		m.saveGen++
 		return m, m.autosave()
 
 	case "H":
@@ -248,6 +398,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.cardIdx = m.b.MoveCardWithinColumn(col.ID, m.cardIdx, -1)
 		m.dirty = true
+		m.saveGen++
 		return m, m.autosave()
 
 	case "J":
@@ -258,6 +409,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.cardIdx = m.b.MoveCardWithinColumn(col.ID, m.cardIdx, 1)
 		m.dirty = true
+		m.saveGen++
 		return m, m.autosave()
 
 	case "n":
@@ -273,29 +425,35 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.mode = modeRenameColumn
+		m.targetColumnID = col.ID
 		m.input.Placeholder = "Column name"
 		m.input.SetValue(col.Title)
 		m.input.Focus()
 		return m, textinput.Blink
 
 	case "x":
-		if m.currentColumn() == nil {
+		col := m.currentColumn()
+		if col == nil {
 			return m, nil
 		}
 		m.mode = modeConfirmDeleteColumn
+		m.deleteColumnID = col.ID
 		return m, nil
 
 	case "shift+left":
 		m.colIdx = m.b.MoveColumn(m.colIdx, -1)
 		m.dirty = true
+		m.saveGen++
 		return m, m.autosave()
 
 	case "shift+right":
 		m.colIdx = m.b.MoveColumn(m.colIdx, 1)
 		m.dirty = true
+		m.saveGen++
 		return m, m.autosave()
 
 	case "s":
+		m.saveGen++
 		return m, m.saveNow()
 	}
 	return m, nil
@@ -316,42 +474,55 @@ func (m *Model) moveCardColumn(delta int) (tea.Model, tea.Cmd) {
 	m.colIdx = targetIdx
 	m.cardIdx = len(target.CardOrder) - 1
 	m.dirty = true
+	m.saveGen++
 	return *m, m.autosave()
 }
 
 func (m Model) handleTextInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		m.mode = modeNormal
 		m.input.Blur()
+		m.returnToNormal()
 		return m, nil
 
 	case "enter":
 		value := m.input.Value()
-		switch m.mode {
+		mo := m.mode
+		targetColumnID := m.targetColumnID
+		m.input.Blur()
+		m.returnToNormal()
+
+		switch mo {
 		case modeAddCard:
 			if value != "" {
-				col := m.currentColumn()
-				m.b.AddCard(col.ID, value)
-				m.cardIdx = len(col.CardOrder) - 1
-				m.dirty = true
+				if col, ok := m.b.Columns[targetColumnID]; ok {
+					m.b.AddCard(col.ID, value)
+					for i, id := range m.b.ColumnOrder {
+						if id == col.ID {
+							m.colIdx = i
+						}
+					}
+					m.cardIdx = len(col.CardOrder) - 1
+					m.dirty = true
+				}
 			}
 		case modeAddColumn:
 			if value != "" {
 				m.b.AddColumn(value)
 				m.colIdx = len(m.b.ColumnOrder) - 1
 				m.cardIdx = 0
-			}
-			m.dirty = true
-		case modeRenameColumn:
-			if value != "" {
-				m.b.RenameColumn(m.currentColumn().ID, value)
 				m.dirty = true
 			}
+		case modeRenameColumn:
+			if value != "" {
+				if col, ok := m.b.Columns[targetColumnID]; ok {
+					m.b.RenameColumn(col.ID, value)
+					m.dirty = true
+				}
+			}
 		}
-		m.mode = modeNormal
-		m.input.Blur()
 		if m.dirty {
+			m.saveGen++
 			return m, m.autosave()
 		}
 		return m, nil
@@ -365,9 +536,9 @@ func (m Model) handleTextInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleEditCardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		m.mode = modeNormal
 		m.input.Blur()
 		m.textarea.Blur()
+		m.returnToNormal()
 		return m, nil
 
 	case "tab":
@@ -383,11 +554,15 @@ func (m Model) handleEditCardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "ctrl+s":
-		m.b.UpdateCard(m.editingCardID, m.input.Value(), m.textarea.Value())
-		m.dirty = true
-		m.mode = modeNormal
+		cardID := m.editingCardID
+		title := m.input.Value()
+		body := m.textarea.Value()
 		m.input.Blur()
 		m.textarea.Blur()
+		m.returnToNormal()
+		m.b.UpdateCard(cardID, title, body)
+		m.dirty = true
+		m.saveGen++
 		return m, m.autosave()
 	}
 
@@ -405,25 +580,17 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "y":
 		switch m.mode {
 		case modeConfirmDeleteCard:
-			if c := m.selectedCard(); c != nil {
-				m.b.DeleteCard(c.ID)
-				m.clampCardIdx()
-				m.dirty = true
-			}
+			m.b.DeleteCard(m.deleteCardID)
+			m.clampCardIdx()
+			m.dirty = true
 		case modeConfirmDeleteColumn:
-			if col := m.currentColumn(); col != nil {
-				m.b.DeleteColumn(col.ID)
-				if m.colIdx >= len(m.b.ColumnOrder) {
-					m.colIdx = len(m.b.ColumnOrder) - 1
-				}
-				if m.colIdx < 0 {
-					m.colIdx = 0
-				}
-				m.clampCardIdx()
-				m.dirty = true
-			}
+			m.b.DeleteColumn(m.deleteColumnID)
+			m.colIdx = clamp(m.colIdx, 0, len(m.b.ColumnOrder)-1)
+			m.clampCardIdx()
+			m.dirty = true
 		}
 		m.mode = modeNormal
+		m.saveGen++
 		return m, m.autosave()
 	case "n", "esc":
 		m.mode = modeNormal
@@ -432,11 +599,20 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// autosave dispatches the current board for saving. It clones m.b
+// synchronously (not just captures the pointer) so the save operates on a
+// frozen snapshot of what the user just did, even if an external reload
+// replaces m.b's contents before this save's goroutine actually runs.
+// Callers must bump m.saveGen before calling this, so the eventual
+// saveResultMsg carries the right generation for staleness checks.
 func (m Model) autosave() tea.Cmd {
-	b := m.b
-	path := m.path
+	return saveCmd(m.path, m.base, m.b.Clone(), m.lastHash, m.saveGen)
+}
+
+func saveCmd(path string, base, ours *board.Board, lastHash string, gen int) tea.Cmd {
 	return func() tea.Msg {
-		return saveResultMsg{err: board.Save(path, b)}
+		toWrite, merged, hash, err := board.SaveMerging(path, base, ours, lastHash)
+		return saveResultMsg{gen: gen, board: toWrite, merged: merged, hash: hash, err: err}
 	}
 }
 
@@ -445,11 +621,13 @@ func (m Model) saveNow() tea.Cmd {
 }
 
 func (m Model) saveAndQuit() tea.Cmd {
-	b := m.b
+	ours := m.b.Clone()
+	base := m.base
 	path := m.path
+	lastHash := m.lastHash
 	return tea.Sequence(
 		func() tea.Msg {
-			board.Save(path, b)
+			board.SaveMerging(path, base, ours, lastHash)
 			return nil
 		},
 		tea.Quit,
