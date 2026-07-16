@@ -34,9 +34,16 @@ func main() {
 	}
 
 	p := tea.NewProgram(ui.NewModel(b, path, hash, w), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	finalModel, err := p.Run()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "kankan-tui: %v\n", err)
 		os.Exit(1)
+	}
+	if fm, ok := finalModel.(ui.Model); ok {
+		if saveErr := fm.Err(); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "kankan-tui: warning: last save failed: %v\n", saveErr)
+			os.Exit(1)
+		}
 	}
 }
 

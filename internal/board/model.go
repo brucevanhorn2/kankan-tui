@@ -38,9 +38,9 @@ type Board struct {
 // New creates a board with the default Todo / In Progress / Done columns.
 func New(name string) *Board {
 	now := time.Now()
-	todo := &Column{ID: uuid.NewString(), Title: "Todo", CardOrder: []string{}, CreatedAt: now}
-	inProgress := &Column{ID: uuid.NewString(), Title: "In Progress", CardOrder: []string{}, CreatedAt: now}
-	done := &Column{ID: uuid.NewString(), Title: "Done", CardOrder: []string{}, CreatedAt: now}
+	todo := &Column{ID: uuid.NewString(), Title: "Todo", CardOrder: []string{}, CreatedAt: now, UpdatedAt: now}
+	inProgress := &Column{ID: uuid.NewString(), Title: "In Progress", CardOrder: []string{}, CreatedAt: now, UpdatedAt: now}
+	done := &Column{ID: uuid.NewString(), Title: "Done", CardOrder: []string{}, CreatedAt: now, UpdatedAt: now}
 	return &Board{
 		ID:          uuid.NewString(),
 		Name:        name,

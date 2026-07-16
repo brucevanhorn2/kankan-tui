@@ -1,6 +1,7 @@
 package board
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -64,6 +65,47 @@ func TestSaveMerging_ConcurrentWriterIsNotClobbered(t *testing.T) {
 	}
 	if len(onDisk.Cards) != 2 {
 		t.Fatalf("expected 2 cards on disk after merge, got %d", len(onDisk.Cards))
+	}
+}
+
+// TestSaveMerging_LoadErrorFailsInsteadOfOverwriting covers the failure
+// mode a real concurrent writer is most likely to produce: caught with the
+// file in a state SaveMerging can't parse (e.g. a non-atomic writer mid-
+// write). It must fail rather than silently falling back to a blind
+// overwrite, which would discard whatever that writer was in the middle of
+// persisting.
+func TestSaveMerging_LoadErrorFailsInsteadOfOverwriting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "board.json")
+
+	b := New("board")
+	hash, err := Save(path, b)
+	if err != nil {
+		t.Fatalf("initial save: %v", err)
+	}
+
+	if err := os.WriteFile(path, []byte("{not valid json"), 0o644); err != nil {
+		t.Fatalf("corrupt file: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read corrupted file: %v", err)
+	}
+
+	base := b.Clone()
+	ours := b.Clone()
+	ours.AddColumn("Backlog")
+
+	if _, _, _, err := SaveMerging(path, base, ours, hash); err == nil {
+		t.Fatalf("expected SaveMerging to fail when on-disk state can't be read, got nil error")
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file after failed SaveMerging: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("expected SaveMerging to leave the file untouched on a Load failure, but it changed")
 	}
 }
 

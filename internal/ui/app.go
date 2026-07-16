@@ -79,6 +79,23 @@ type Model struct {
 	// save superseded by a later one before it returned) can be told
 	// apart from the latest and ignored instead of regressing the model.
 	saveGen int
+	// saveInFlight is true while a save goroutine is running. Only one
+	// save is ever dispatched at a time: dispatching a second save while
+	// the first is still in flight would capture the same stale
+	// base/lastHash the first save is about to make obsolete, causing the
+	// second save to needlessly (and lossily) merge against its own
+	// process's prior write. See dispatchSave.
+	saveInFlight bool
+	// pendingSave is set when an edit asks for a save while one is
+	// already in flight. The in-flight save's completion handler checks
+	// this and immediately dispatches the coalesced follow-up against the
+	// now-fresh base/lastHash, instead of the edit racing a second save
+	// against the first.
+	pendingSave bool
+	// quitting is set once the user has asked to quit. The program only
+	// actually quits once any in-flight/pending save has finished, so a
+	// save on the way out is never abandoned mid-flight.
+	quitting bool
 
 	dirty     bool
 	status    string
@@ -173,24 +190,48 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Superseded by a later save dispatched before this one
 			// returned; that save's snapshot already included whatever
 			// this one was trying to persist, so just drop it rather
-			// than regress the model with stale state.
+			// than regress the model with stale state. Shouldn't happen
+			// now that saves are single-flight (see dispatchSave), kept
+			// as a defensive invariant check.
 			return m, nil
 		}
+		m.saveInFlight = false
 		if msg.err != nil {
+			m.pendingSave = false
 			m.err = msg.err
 			m.status = fmt.Sprintf("save failed: %v", msg.err)
-		} else {
-			m.dirty = false
-			m.lastHash = msg.hash
-			m.base = msg.board.Clone()
-			if msg.merged {
-				m.b.ReplaceFrom(msg.board)
-				m.colIdx = clamp(m.colIdx, 0, len(m.b.ColumnOrder)-1)
-				m.clampCardIdx()
-				m.status = "merged external changes and saved"
-			} else {
-				m.status = "saved"
+			if m.quitting {
+				return m, tea.Quit
 			}
+			m.statusTok++
+			return m, clearStatusCmd(m.statusTok)
+		}
+
+		m.dirty = false
+		m.err = nil
+		m.lastHash = msg.hash
+		m.base = msg.board.Clone()
+		if msg.merged {
+			m.b.ReplaceFrom(msg.board)
+			m.colIdx = clamp(m.colIdx, 0, len(m.b.ColumnOrder)-1)
+			m.clampCardIdx()
+			m.status = "merged external changes and saved"
+		} else {
+			m.status = "saved"
+		}
+
+		if m.pendingSave {
+			// An edit arrived while this save was in flight; the
+			// coalesced follow-up picks it up now against the base/
+			// lastHash we just refreshed, instead of racing this save
+			// with a second one against stale ancestor state.
+			m.pendingSave = false
+			cmd := m.dispatchSave()
+			m.statusTok++
+			return m, tea.Batch(cmd, clearStatusCmd(m.statusTok))
+		}
+		if m.quitting {
+			return m, tea.Quit
 		}
 		m.statusTok++
 		return m, clearStatusCmd(m.statusTok)
@@ -226,8 +267,11 @@ func (m Model) handleReloaded(msg reloadedMsg) Model {
 		// The next fs event will give us another chance.
 		return m
 	}
-	if msg.hash == m.lastHash {
+	if msg.hash == m.lastHash || board.IsSelfWrite(msg.hash) {
 		// Our own save (or an external write with identical content).
+		// IsSelfWrite covers the case where the fs watcher's notification
+		// of our own atomic rename reaches here before this process's own
+		// saveResultMsg has updated m.lastHash.
 		return m
 	}
 	m.lastHash = msg.hash
@@ -306,7 +350,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
-		return m, m.saveAndQuit()
+		m.quitting = true
+		if !m.dirty && !m.saveInFlight {
+			return m, tea.Quit
+		}
+		return m, m.dispatchSave()
 
 	case "?":
 		m.mode = modeHelp
@@ -380,9 +428,9 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		c.Color = nextCardColor(c.Color)
+		c.UpdatedAt = time.Now()
 		m.dirty = true
-		m.saveGen++
-		return m, m.autosave()
+		return m, m.dispatchSave()
 
 	case "H":
 		return m.moveCardColumn(-1)
@@ -398,8 +446,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.cardIdx = m.b.MoveCardWithinColumn(col.ID, m.cardIdx, -1)
 		m.dirty = true
-		m.saveGen++
-		return m, m.autosave()
+		return m, m.dispatchSave()
 
 	case "J":
 		col := m.currentColumn()
@@ -409,8 +456,7 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.cardIdx = m.b.MoveCardWithinColumn(col.ID, m.cardIdx, 1)
 		m.dirty = true
-		m.saveGen++
-		return m, m.autosave()
+		return m, m.dispatchSave()
 
 	case "n":
 		m.mode = modeAddColumn
@@ -443,18 +489,15 @@ func (m Model) handleNormalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "shift+left":
 		m.colIdx = m.b.MoveColumn(m.colIdx, -1)
 		m.dirty = true
-		m.saveGen++
-		return m, m.autosave()
+		return m, m.dispatchSave()
 
 	case "shift+right":
 		m.colIdx = m.b.MoveColumn(m.colIdx, 1)
 		m.dirty = true
-		m.saveGen++
-		return m, m.autosave()
+		return m, m.dispatchSave()
 
 	case "s":
-		m.saveGen++
-		return m, m.saveNow()
+		return m, m.dispatchSave()
 	}
 	return m, nil
 }
@@ -474,8 +517,7 @@ func (m *Model) moveCardColumn(delta int) (tea.Model, tea.Cmd) {
 	m.colIdx = targetIdx
 	m.cardIdx = len(target.CardOrder) - 1
 	m.dirty = true
-	m.saveGen++
-	return *m, m.autosave()
+	return *m, m.dispatchSave()
 }
 
 func (m Model) handleTextInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -522,8 +564,7 @@ func (m Model) handleTextInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if m.dirty {
-			m.saveGen++
-			return m, m.autosave()
+			return m, m.dispatchSave()
 		}
 		return m, nil
 	}
@@ -562,8 +603,7 @@ func (m Model) handleEditCardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.returnToNormal()
 		m.b.UpdateCard(cardID, title, body)
 		m.dirty = true
-		m.saveGen++
-		return m, m.autosave()
+		return m, m.dispatchSave()
 	}
 
 	var cmd tea.Cmd
@@ -590,8 +630,7 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.dirty = true
 		}
 		m.mode = modeNormal
-		m.saveGen++
-		return m, m.autosave()
+		return m, m.dispatchSave()
 	case "n", "esc":
 		m.mode = modeNormal
 		return m, nil
@@ -599,13 +638,21 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// autosave dispatches the current board for saving. It clones m.b
-// synchronously (not just captures the pointer) so the save operates on a
-// frozen snapshot of what the user just did, even if an external reload
-// replaces m.b's contents before this save's goroutine actually runs.
-// Callers must bump m.saveGen before calling this, so the eventual
-// saveResultMsg carries the right generation for staleness checks.
-func (m Model) autosave() tea.Cmd {
+// dispatchSave is the single entry point for triggering a save. Only one
+// save goroutine ever runs at a time: if one is already in flight, this
+// just records that another save is wanted (m.pendingSave) instead of
+// dispatching a second one, which would capture the same base/lastHash the
+// in-flight save is about to make stale and needlessly (and lossily) merge
+// against this process's own prior write. See the saveResultMsg handler in
+// Update, which dispatches the coalesced follow-up once the in-flight save
+// completes.
+func (m *Model) dispatchSave() tea.Cmd {
+	if m.saveInFlight {
+		m.pendingSave = true
+		return nil
+	}
+	m.saveInFlight = true
+	m.saveGen++
 	return saveCmd(m.path, m.base, m.b.Clone(), m.lastHash, m.saveGen)
 }
 
@@ -616,22 +663,11 @@ func saveCmd(path string, base, ours *board.Board, lastHash string, gen int) tea
 	}
 }
 
-func (m Model) saveNow() tea.Cmd {
-	return m.autosave()
-}
-
-func (m Model) saveAndQuit() tea.Cmd {
-	ours := m.b.Clone()
-	base := m.base
-	path := m.path
-	lastHash := m.lastHash
-	return tea.Sequence(
-		func() tea.Msg {
-			board.SaveMerging(path, base, ours, lastHash)
-			return nil
-		},
-		tea.Quit,
-	)
+// Err returns the most recent save error, if any. Checked by main after
+// the program exits (and the terminal is restored) so a save that failed
+// on the way out isn't silently swallowed.
+func (m Model) Err() error {
+	return m.err
 }
 
 func nextCardColor(current string) string {

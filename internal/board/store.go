@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,6 +18,32 @@ import (
 // nothing to coordinate with other processes, which is what the merge in
 // SaveMerging is for.
 var saveMu sync.Mutex
+
+// selfMu guards selfHash, the hash of the most recent save this process
+// performed via SaveMerging.
+var selfMu sync.Mutex
+var selfHash string
+
+// markSelfWrite records the hash of a save this process just performed.
+// The fs watcher fires on our own atomic rename just like it would for an
+// external writer, and that notification can reach the UI before the
+// saveResultMsg carrying the same hash does (they're two independent
+// goroutines racing to the same Update loop). Checking IsSelfWrite lets
+// the reload path recognize its own write immediately, without depending
+// on message delivery order.
+func markSelfWrite(hash string) {
+	selfMu.Lock()
+	selfHash = hash
+	selfMu.Unlock()
+}
+
+// IsSelfWrite reports whether hash matches the most recent save this
+// process performed via SaveMerging.
+func IsSelfWrite(hash string) bool {
+	selfMu.Lock()
+	defer selfMu.Unlock()
+	return hash == selfHash
+}
 
 // Load reads a board file and returns it along with a content hash, so the
 // caller can later tell its own writes apart from external changes to the
@@ -71,21 +98,31 @@ func Save(path string, b *Board) (string, error) {
 // before writing, instead of blindly overwriting the other writer's
 // change. Returns the board actually written (ours unchanged, or the
 // merge result) and whether a merge happened.
+//
+// If the on-disk state can't be read at all - e.g. a concurrent writer is
+// mid-write - SaveMerging fails rather than silently falling back to a
+// blind overwrite: that's the one situation a real concurrent writer is
+// most likely to produce, and overwriting blind there would defeat the
+// point of merging in the first place. Callers should retry.
 func SaveMerging(path string, base, ours *Board, lastHash string) (toWrite *Board, merged bool, hash string, err error) {
 	saveMu.Lock()
 	defer saveMu.Unlock()
 
+	onDisk, diskHash, loadErr := Load(path)
+	if loadErr != nil {
+		return nil, false, "", fmt.Errorf("checking for concurrent changes: %w", loadErr)
+	}
+
 	toWrite = ours
-	if base != nil {
-		if onDisk, diskHash, loadErr := Load(path); loadErr == nil && diskHash != lastHash {
-			toWrite = Merge(base, ours, onDisk)
-			merged = true
-		}
+	if diskHash != lastHash {
+		toWrite = Merge(base, ours, onDisk)
+		merged = true
 	}
 	hash, err = Save(path, toWrite)
 	if err != nil {
 		return nil, false, "", err
 	}
+	markSelfWrite(hash)
 	return toWrite, merged, hash, nil
 }
 

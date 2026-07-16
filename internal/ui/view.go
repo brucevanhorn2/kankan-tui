@@ -24,16 +24,18 @@ func (m Model) View() string {
 	case modeEditCard:
 		return m.renderEditCardModal()
 	case modeConfirmDeleteCard:
-		c := m.selectedCard()
+		// Render the card by the ID captured at 'd'-press time, the same
+		// ID handleConfirmKey deletes on 'y' - not the cursor-selected
+		// card, which can drift out from under the dialog if an external
+		// change is applied while it's open.
 		title := ""
-		if c != nil {
+		if c, ok := m.b.Cards[m.deleteCardID]; ok {
 			title = c.Title
 		}
 		return m.renderModal("Delete card?", dangerStyle.Render(fmt.Sprintf("%q will be deleted.", title)), "y: delete   n/esc: cancel")
 	case modeConfirmDeleteColumn:
-		col := m.currentColumn()
 		title := ""
-		if col != nil {
+		if col, ok := m.b.Columns[m.deleteColumnID]; ok {
 			title = col.Title
 		}
 		return m.renderModal("Delete column?", dangerStyle.Render(fmt.Sprintf("%q and all its cards will be deleted.", title)), "y: delete   n/esc: cancel")

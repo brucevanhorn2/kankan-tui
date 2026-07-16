@@ -139,6 +139,28 @@ func TestMerge_ColumnDeletedExternallyDropsOrphanCard(t *testing.T) {
 	}
 }
 
+func TestMerge_ConflictingEditsExactTieFavorsOurs(t *testing.T) {
+	base := newTestBoard()
+	todoID := base.ColumnOrder[0]
+	card := base.AddCard(todoID, "original")
+
+	same := time.Now()
+
+	ours := base.Clone()
+	ours.Cards[card.ID].Title = "ours title"
+	ours.Cards[card.ID].UpdatedAt = same
+
+	theirs := base.Clone()
+	theirs.Cards[card.ID].Title = "theirs title"
+	theirs.Cards[card.ID].UpdatedAt = same
+
+	merged := Merge(base, ours, theirs)
+
+	if got := merged.Cards[card.ID].Title; got != "ours title" {
+		t.Fatalf("expected an exact UpdatedAt tie to favor ours (the side doing the save), got %q", got)
+	}
+}
+
 func TestMerge_NoConflictIsIdempotent(t *testing.T) {
 	base := newTestBoard()
 	same := base.Clone()

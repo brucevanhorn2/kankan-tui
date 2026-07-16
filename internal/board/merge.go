@@ -112,10 +112,10 @@ func cardChanged(a, b *Card) bool {
 }
 
 func newerCard(o, t *Card) *Card {
-	if o.UpdatedAt.After(t.UpdatedAt) {
-		return o
+	if t.UpdatedAt.After(o.UpdatedAt) {
+		return t
 	}
-	return t
+	return o
 }
 
 func cloneCard(c *Card) *Card {
@@ -184,10 +184,10 @@ func columnChanged(a, b *Column) bool {
 }
 
 func newerColumn(o, t *Column) *Column {
-	if o.UpdatedAt.After(t.UpdatedAt) {
-		return o
+	if t.UpdatedAt.After(o.UpdatedAt) {
+		return t
 	}
-	return t
+	return o
 }
 
 // cloneColumnMeta copies a column's identity/title fields but not its
