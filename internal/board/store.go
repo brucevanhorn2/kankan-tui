@@ -45,11 +45,23 @@ func IsSelfWrite(hash string) bool {
 	return hash == selfHash
 }
 
+// readFile reads a board file's raw bytes along with their content hash,
+// without parsing it - so a caller that only needs to check whether the
+// file has changed (the common case in SaveMerging) doesn't pay for a JSON
+// unmarshal it may not need.
+func readFile(path string) ([]byte, string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	return data, Hash(data), nil
+}
+
 // Load reads a board file and returns it along with a content hash, so the
 // caller can later tell its own writes apart from external changes to the
 // same file (see Watcher).
 func Load(path string) (*Board, string, error) {
-	data, err := os.ReadFile(path)
+	data, hash, err := readFile(path)
 	if err != nil {
 		return nil, "", err
 	}
@@ -57,7 +69,7 @@ func Load(path string) (*Board, string, error) {
 	if err := json.Unmarshal(data, &b); err != nil {
 		return nil, "", err
 	}
-	return &b, Hash(data), nil
+	return &b, hash, nil
 }
 
 // Save writes the board as indented JSON, using a temp-file-then-rename
@@ -104,18 +116,26 @@ func Save(path string, b *Board) (string, error) {
 // blind overwrite: that's the one situation a real concurrent writer is
 // most likely to produce, and overwriting blind there would defeat the
 // point of merging in the first place. Callers should retry.
+//
+// The common case - nobody else has touched the file - only needs the
+// on-disk hash to confirm that, so the full JSON parse of onDisk is
+// skipped unless a merge actually turns out to be necessary.
 func SaveMerging(path string, base, ours *Board, lastHash string) (toWrite *Board, merged bool, hash string, err error) {
 	saveMu.Lock()
 	defer saveMu.Unlock()
 
-	onDisk, diskHash, loadErr := Load(path)
+	data, diskHash, loadErr := readFile(path)
 	if loadErr != nil {
 		return nil, false, "", fmt.Errorf("checking for concurrent changes: %w", loadErr)
 	}
 
 	toWrite = ours
 	if diskHash != lastHash {
-		toWrite = Merge(base, ours, onDisk)
+		var onDisk Board
+		if err := json.Unmarshal(data, &onDisk); err != nil {
+			return nil, false, "", fmt.Errorf("checking for concurrent changes: %w", err)
+		}
+		toWrite = Merge(base, ours, &onDisk)
 		merged = true
 	}
 	hash, err = Save(path, toWrite)

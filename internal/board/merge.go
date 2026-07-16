@@ -51,7 +51,17 @@ func Merge(base, ours, theirs *Board) *Board {
 	return merged
 }
 
-func mergeCards(base, ours, theirs *Board, merged *Board) {
+// mergeEntities is the three-way-merge-by-ID algorithm shared by
+// mergeCards and mergeColumns: for every id present in any of base/ours/
+// theirs, decide (via changed/newer) what survives into mergedMap. The
+// two callers differ only in the concrete type and its changed/newer/
+// clone semantics.
+func mergeEntities[T any](
+	baseMap, oursMap, theirsMap, mergedMap map[string]*T,
+	changed func(a, b *T) bool,
+	newer func(o, t *T) *T,
+	clone func(*T) *T,
+) {
 	seen := map[string]bool{}
 	consider := func(id string) {
 		if seen[id] {
@@ -59,52 +69,56 @@ func mergeCards(base, ours, theirs *Board, merged *Board) {
 		}
 		seen[id] = true
 
-		b, hasBase := base.Cards[id]
-		o, hasOurs := ours.Cards[id]
-		t, hasTheirs := theirs.Cards[id]
+		b, hasBase := baseMap[id]
+		o, hasOurs := oursMap[id]
+		t, hasTheirs := theirsMap[id]
 
 		switch {
 		case !hasBase && hasOurs && !hasTheirs:
-			merged.Cards[id] = cloneCard(o)
+			mergedMap[id] = clone(o)
 		case !hasBase && !hasOurs && hasTheirs:
-			merged.Cards[id] = cloneCard(t)
+			mergedMap[id] = clone(t)
 		case !hasBase && hasOurs && hasTheirs:
-			merged.Cards[id] = cloneCard(newerCard(o, t))
+			mergedMap[id] = clone(newer(o, t))
 		case hasBase && !hasOurs && !hasTheirs:
 			// deleted on both sides
 		case hasBase && !hasOurs && hasTheirs:
-			if cardChanged(b, t) {
-				merged.Cards[id] = cloneCard(t) // edit wins over delete
+			if changed(b, t) {
+				mergedMap[id] = clone(t) // edit wins over delete
 			}
 		case hasBase && hasOurs && !hasTheirs:
-			if cardChanged(b, o) {
-				merged.Cards[id] = cloneCard(o) // edit wins over delete
+			if changed(b, o) {
+				mergedMap[id] = clone(o) // edit wins over delete
 			}
 		default: // present on all three
-			oc := cardChanged(b, o)
-			tc := cardChanged(b, t)
+			oc := changed(b, o)
+			tc := changed(b, t)
 			switch {
 			case oc && !tc:
-				merged.Cards[id] = cloneCard(o)
+				mergedMap[id] = clone(o)
 			case !oc && tc:
-				merged.Cards[id] = cloneCard(t)
+				mergedMap[id] = clone(t)
 			case oc && tc:
-				merged.Cards[id] = cloneCard(newerCard(o, t))
+				mergedMap[id] = clone(newer(o, t))
 			default:
-				merged.Cards[id] = cloneCard(t)
+				mergedMap[id] = clone(t)
 			}
 		}
 	}
 
-	for id := range base.Cards {
+	for id := range baseMap {
 		consider(id)
 	}
-	for id := range ours.Cards {
+	for id := range oursMap {
 		consider(id)
 	}
-	for id := range theirs.Cards {
+	for id := range theirsMap {
 		consider(id)
 	}
+}
+
+func mergeCards(base, ours, theirs *Board, merged *Board) {
+	mergeEntities(base.Cards, ours.Cards, theirs.Cards, merged.Cards, cardChanged, newerCard, cloneCard)
 }
 
 func cardChanged(a, b *Card) bool {
@@ -124,59 +138,7 @@ func cloneCard(c *Card) *Card {
 }
 
 func mergeColumns(base, ours, theirs *Board, merged *Board) {
-	seen := map[string]bool{}
-	consider := func(id string) {
-		if seen[id] {
-			return
-		}
-		seen[id] = true
-
-		b, hasBase := base.Columns[id]
-		o, hasOurs := ours.Columns[id]
-		t, hasTheirs := theirs.Columns[id]
-
-		switch {
-		case !hasBase && hasOurs && !hasTheirs:
-			merged.Columns[id] = cloneColumnMeta(o)
-		case !hasBase && !hasOurs && hasTheirs:
-			merged.Columns[id] = cloneColumnMeta(t)
-		case !hasBase && hasOurs && hasTheirs:
-			merged.Columns[id] = cloneColumnMeta(newerColumn(o, t))
-		case hasBase && !hasOurs && !hasTheirs:
-			// deleted on both sides
-		case hasBase && !hasOurs && hasTheirs:
-			if columnChanged(b, t) {
-				merged.Columns[id] = cloneColumnMeta(t)
-			}
-		case hasBase && hasOurs && !hasTheirs:
-			if columnChanged(b, o) {
-				merged.Columns[id] = cloneColumnMeta(o)
-			}
-		default:
-			oc := columnChanged(b, o)
-			tc := columnChanged(b, t)
-			switch {
-			case oc && !tc:
-				merged.Columns[id] = cloneColumnMeta(o)
-			case !oc && tc:
-				merged.Columns[id] = cloneColumnMeta(t)
-			case oc && tc:
-				merged.Columns[id] = cloneColumnMeta(newerColumn(o, t))
-			default:
-				merged.Columns[id] = cloneColumnMeta(t)
-			}
-		}
-	}
-
-	for id := range base.Columns {
-		consider(id)
-	}
-	for id := range ours.Columns {
-		consider(id)
-	}
-	for id := range theirs.Columns {
-		consider(id)
-	}
+	mergeEntities(base.Columns, ours.Columns, theirs.Columns, merged.Columns, columnChanged, newerColumn, cloneColumnMeta)
 }
 
 func columnChanged(a, b *Column) bool {
