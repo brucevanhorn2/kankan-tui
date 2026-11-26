@@ -69,6 +69,8 @@ Merge policy:
 
 Saves from this process itself are serialized against each other (so two rapid local saves can't race), but there's no cross-process locking — the merge is what keeps concurrent writers from stepping on each other, not mutual exclusion.
 
+`q` / `ctrl+c` waits for any save still in flight to finish before exiting, rather than quitting out from under it. If that final save fails, kankan-tui prints a warning to stderr and exits with a non-zero status instead of quitting silently.
+
 ## Architecture
 
 ```
